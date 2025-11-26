@@ -4,6 +4,7 @@ import logging
 import psycopg2
 import urllib.parse
 from datetime import datetime
+import pytz
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -18,19 +19,22 @@ from telegram.ext import (
     filters,
 )
 
-# Import the keep_alive script
-from keep_alive import keep_alive  
+# --- KEEP ALIVE ---
+try:
+    from keep_alive import keep_alive
+except ImportError:
+    def keep_alive(): pass
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN") 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
+# default to 0 if not set, prevents crash on startup
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else 0
-DATABASE_URL = os.getenv("DATABASE_URL") 
-
-WELCOME_VIDEO = "pos 1.jpg" 
+DATABASE_URL = os.getenv("DATABASE_URL")
+WELCOME_VIDEO = "pos 1.jpg"
 
 # --- GLOBAL CACHE FOR WELCOME MEDIA ---
-WELCOME_MEDIA_CACHE = {"id": None, "type": None} 
+WELCOME_MEDIA_CACHE = {"id": None, "type": None}
 
 # --- TIERED COMMISSION CONFIGURATION ---
 TIERED_COMMISSION = {
@@ -101,48 +105,66 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (Robust Connection with Failover) ----------------
-# This version attempts IPv4 resolution first, then falls back to standard connection
-# to avoid crashes on Render Free Tier.
+# ---------------- Database setup (Hybrid DNS Resolution for IPv4/IPv6 Issues) ----------------
 
 def get_db_connection():
     if not DATABASE_URL:
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        # 1. Parse the DATABASE_URL to extract credentials
         url = urllib.parse.urlparse(DATABASE_URL)
         username = url.username
         password = url.password
-        database = url.path[1:]
+        database = url.path[1:]  # Remove leading '/'
         port = url.port or 5432
         hostname = url.hostname
-        
-        final_host = hostname
-        
-        # 2. Attempt to force IPv4 (Render Fix)
-        # We wrap this in a try/except block so it doesn't crash the bot if DNS fails
+
+        ip_address = None
         try:
-            addr_info = socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
-            ip_address = addr_info[0][4][0]
-            final_host = ip_address
-            logger.info(f"Successfully resolved {hostname} to IPv4: {ip_address}")
+            # STRICTLY LOOK FOR IPv4 (AF_INET)
+            # This avoids getting an IPv6 address which Render fails on
+            # logger.info(f"Attempting to resolve {hostname} to IPv4...")
+            infos = socket.getaddrinfo(hostname, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+            if infos:
+                ip_address = infos[0][4][0]
+                logger.info(f"Resolved {hostname} to IPv4: {ip_address}")
         except Exception as dns_err:
-            logger.warning(f"IPv4 resolution failed ({dns_err}). Trying standard connection to {hostname}...")
-            # If resolution fails, we KEEP final_host as the original hostname
-            # This allows the standard library to try its own connection logic
-        
-        # 3. Connect (using either the resolved IP or the original hostname)
-        conn = psycopg2.connect(
-            database=database,
-            user=username,
-            password=password,
-            host=final_host,
-            port=port
-        )
+            if "supa" in str(hostname):
+                logger.critical("\n\n" + "="*50)
+                logger.critical("❌ IPV4 RESOLUTION FAILED FOR SUPABASE DATABASE")
+                logger.critical("Your Supabase connection string is likely using the DIRECT (IPv6-only) URL.")
+                logger.critical("Render REQUIRES IPv4. You MUST use the Supavisor POOLER URL.")
+                logger.critical(f"Current Host: {hostname} (Port: {port})")
+                logger.critical("👉 ACTION REQUIRED: Go to Supabase Dashboard -> Project Settings -> Database -> Connection Pooling.")
+                logger.critical("👉 Copy the URL (port 6543) and update your Render DATABASE_URL environment variable.")
+                logger.critical("="*50 + "\n\n")
+            else:
+                logger.error(f"IPv4 DNS Resolution failed for {hostname}: {dns_err}")
+            ip_address = None
+
+        if ip_address:
+            conn = psycopg2.connect(
+                database=database,
+                user=username,
+                password=password,
+                host=hostname,       
+                hostaddr=ip_address, # Force IPv4
+                port=port,
+                sslmode='require'
+            )
+        else:
+            # Fallback - will likely fail on Render if no IPv4 was found
+            conn = psycopg2.connect(
+                database=database,
+                user=username,
+                password=password,
+                host=hostname,
+                port=port,
+                sslmode='require'
+            )
         return conn
     except Exception as e:
-        logger.error(f"CRITICAL: DB Connection failed. Error: {e}")
+        logger.error(f"DB Connection failed: {e}")
         return None
 
 def init_db():
@@ -214,8 +236,7 @@ def init_db():
 try:
     init_db()
 except Exception as e:
-    logger.error(f"Failed to init DB: {e}")
-
+    logger.error(f"Failed to init DB on startup (non-fatal, will retry on demand): {e}")
 
 # ---------------- DB helper functions ----------------
 def get_balance(user_id: int) -> float:
@@ -224,7 +245,7 @@ def get_balance(user_id: int) -> float:
     cursor = conn.cursor()
     cursor.execute("SELECT balance FROM users WHERE user_id=%s", (user_id, ))
     r = cursor.fetchone()
-    if r: 
+    if r:
         bal = r[0]
         cursor.close()
         conn.close()
@@ -240,9 +261,9 @@ def add_balance(user_id: int, amount: float) -> float:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO users (user_id, balance) VALUES (%s, %s) 
-        ON CONFLICT(user_id) 
-        DO UPDATE SET balance = users.balance + EXCLUDED.balance
+    INSERT INTO users (user_id, balance) VALUES (%s, %s)
+    ON CONFLICT(user_id)
+    DO UPDATE SET balance = users.balance + EXCLUDED.balance
     """, (user_id, amount))
     conn.commit()
     cursor.close()
@@ -278,7 +299,7 @@ def update_order_status(order_id: int, status: str):
     conn.commit()
     cursor.close()
     conn.close()
-    
+
 def get_order_details(order_id: int) -> dict or None:
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -341,9 +362,9 @@ def add_affiliate_balance(user_id: int, amount: float):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO users (user_id, affiliate_balance) VALUES (%s, %s) 
-        ON CONFLICT(user_id) 
-        DO UPDATE SET affiliate_balance = users.affiliate_balance + EXCLUDED.affiliate_balance
+    INSERT INTO users (user_id, affiliate_balance) VALUES (%s, %s)
+    ON CONFLICT(user_id)
+    DO UPDATE SET affiliate_balance = users.affiliate_balance + EXCLUDED.affiliate_balance
     """, (user_id, amount))
     conn.commit()
     cursor.close()
@@ -388,7 +409,7 @@ def record_invited_user(inviter_id: int, invited_id: int, username: str, firstna
         cursor.close()
         conn.close()
         return True
-    except psycopg2.IntegrityError: 
+    except psycopg2.IntegrityError:
         cursor.close()
         conn.close()
         return False
@@ -555,15 +576,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             except Exception: pass
         except (ValueError, IndexError): pass
 
-    caption = t(lang, f"""Hello 👋 Welcome to Elevate Promotion advertising agency! Increase your recognition by using Elevate's advertising technology to buy followers, likes, views on YouTube, Facebook, Instagram, TikTok, 
-and by using other services! For more information, call 0955974297 or send a message to @Elevatesupport.
-
-Your balance: {balance:.2f} ETB
-Choose a service below.""", f"""ሰላም 👋  እንኳን ወደ ኢሊቬት ፕሮሞሽን  የ ማስታወቅያ ድርጅት በ ሰላም መጡ ! የ ኢሊቫትን የማስተወቅያ ቴክኖሎጂ በመጠቀም በ Youtube, Facebook , Instagram , Tiktok  ላይ ተከታይ ፣ ላይክ ፣ ቪው በመግዛት 
- እና ሌሎች አገልግሎቶችን በመጠቀም እውቅናዎን ያሳድጉ! ለበለጠ መረጃ በ 0955974297 ይደውሉ ወይም  @Elevatesupport ላይ መልክት ይላኩልን።
-
-ቀሪ ብር: {balance:.2f}
-እባክዎን ከዚህ አገልግሎት ይምረጡ።""")
+    caption = t(lang, f"""Hello 👋 Welcome to Elevate Promotion advertising agency! Increase your recognition by using Elevate's advertising technology to buy followers, likes, views on YouTube, Facebook, Instagram, TikTok,
+    and by using other services! For more information, call 0955974297 or send a message to @Elevatesupport.
+    Your balance: {balance:.2f} ETB
+    Choose a service below.""", f"""ሰላም 👋  እንኳን ወደ ኢሊቬት ፕሮሞሽን  የ ማስታወቅያ ድርጅት በ ሰላም መጡ ! የ ኢሊቫትን የማስተወቅያ ቴክኖሎጂ በመጠቀም በ Youtube, Facebook , Instagram , Tiktok  ላይ ተከታይ ፣ ላይክ ፣ ቪው በመግዛት
+    እና ሌሎች አገልግሎቶችን በመጠቀም እውቅናዎን ያሳድጉ! ለበለጠ መረጃ በ 0955974297 ይደውሉ ወይም  @Elevatesupport ላይ መልክት ይላኩልን።
+    ቀሪ ብር: {balance:.2f}
+    እባክዎን ከዚህ አገልግሎት ይምረጡ።""")
 
     buttons = []
     row = []
@@ -574,7 +593,7 @@ Choose a service below.""", f"""ሰላም 👋  እንኳን ወደ ኢሊቬት
             buttons.append(row)
             row = []
     if row: buttons.append(row)
-    
+
     buttons.append([InlineKeyboardButton(t(lang, "Balance", "ቀሪ ሂሳብ"), callback_data="cmd|balance"), InlineKeyboardButton(t(lang, "Recharge", "ገንዘብ ማስገቢያ"), callback_data="cmd|recharge")])
     buttons.append([InlineKeyboardButton(t(lang, "Affiliate Program", "ሰው በመጋበዝ ገንዘብ ይስሩ"), callback_data="cmd|referral")])
     buttons.append([InlineKeyboardButton(t(lang, "Language", "ቋንቋ"), callback_data="cmd|language")])
@@ -991,7 +1010,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text(t(lang, "Please send a valid number amount.", "እባክዎ ትክክለኛ ቁጥር ይላኩ።"))
         return
-    
+
     # --- Withdrawal Detail ---
     if context.user_data.get("awaiting_withdrawal_detail"):
         detail = update.message.text.strip()
@@ -1143,12 +1162,12 @@ async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         def __init__(self, data, from_user):
             self.data = data
             self.from_user = from_user
-            self.message = None 
-        async def answer(self): pass 
+            self.message = None
+        async def answer(self): pass
     mock_query = MockQuery("cmd|referral", update.effective_user)
-    update.callback_query = mock_query 
+    update.callback_query = mock_query
     await callback_handler(update, context)
-    update.callback_query = None 
+    update.callback_query = None
 
 async def addbalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -1181,19 +1200,19 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     caption_text = (
-        "💸 *በኢሊቬት ገንዘብ ይስሩ!* 💸\n\n"
-        "ብዙ ሰዎች ሌሎችን በመጋበዝ ብቻ በቦታችን በሺዎች የሚቆጠር ገንዘብ እየሰሩ ነው! 😱\n\n"
-        "እርስዎም ጓደኞችዎን በመጋበዝ ከሚያስገቡት ክፍያ ላይ ኮሚሽን ማግኘት ይችላሉ።\n\n"
-        "👇 የመጋበዣ ሊንክዎን ለማግኘት እና ገቢ ለመጀመር ከታች ያለውን ይጫኑ!\n\n"
-        "--------------------------------\n\n"
-        "💸 *Make Money with Elevate!* 💸\n\n"
-        "Many people are making thousands of birr using our bot just by inviting others! 😱\n\n"
-        "Don't miss out! You can also earn commissions on every deposit your friends make.\n\n"
-        "👇 Click the button below to get your Invite Link and start earning today!"
+    "💸 በኢሊቬት ገንዘብ ይስሩ! 💸\n\n"
+    "ብዙ ሰዎች ሌሎችን በመጋበዝ ብቻ በቦታችን በሺዎች የሚቆጠር ገንዘብ እየሰሩ ነው! 😱\n\n"
+    "እርስዎም ጓደኞችዎን በመጋበዝ ከሚያስገቡት ክፍያ ላይ ኮሚሽን ማግኘት ይችላሉ።\n\n"
+    "👇 የመጋበዣ ሊንክዎን ለማግኘት እና ገቢ ለመጀመር ከታች ያለውን ይጫኑ!\n\n"
+    "--------------------------------\n\n"
+    "💸 Make Money with Elevate! 💸\n\n"
+    "Many people are making thousands of birr using our bot just by inviting others! 😱\n\n"
+    "Don't miss out! You can also earn commissions on every deposit your friends make.\n\n"
+    "👇 Click the button below to get your Invite Link and start earning today!"
     )
     keyboard = [[InlineKeyboardButton("💰 Join Affiliate Program / ገንዘብ ማግኘት ይጀምሩ 💰", callback_data="cmd|referral")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    photo_name = "pos 1.jpg" 
+    photo_name = "pos 1.jpg"
     users = get_all_user_ids()
     await update.message.reply_text(f"⏳ Sending Affiliate Promo to {len(users)} users...")
     if not os.path.isfile(photo_name):
@@ -1204,7 +1223,7 @@ async def post_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with open(photo_name, 'rb') as ph:
                 await context.bot.send_photo(chat_id=uid, photo=ph, caption=caption_text, parse_mode='Markdown', reply_markup=reply_markup)
-            success += 1
+                success += 1
         except Exception: pass
     await update.message.reply_text(f"✅ Done! Sent to {success} users.")
 
@@ -1212,16 +1231,16 @@ async def my_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = _get_user_language(user_id)
     context.user_data['lang'] = lang
-    
+
     orders = get_last_orders(user_id)
-    
+
     if not orders:
         msg = t(lang, "You have no order history.", "የትዕዛዝ ታሪክ የለዎትም።")
         await update.message.reply_text(msg)
         return
 
     text = t(lang, "*📦 Your Recent Orders:*\n\n", "*📦 የእርስዎ የቅርብ ትዕዛዞች:*\n\n")
-    
+
     for oid, title, price, status, date in orders:
         status_display = status.upper()
         if status in ['pending', 'pending_approval', 'processing']:
@@ -1239,7 +1258,7 @@ async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = _get_user_language(user_id)
     context.user_data['lang'] = lang
-    
+
     msg = t(lang, 
             "📞 *Support & Info*\n\nFor any issues, deposits, or questions, please contact our support team:\n\n👤 @Elevatesupport\n📞 0955974297",
             "📞 *መረጃ እና እርዳታ*\n\nለማንኛውም ጥያቄ ወይም ችግር፣ እባክዎ የድጋፍ ቡድናችንን ያግኙ:\n\n👤 @Elevatesupport\n📞 0955974297"
@@ -1263,15 +1282,14 @@ def main():
         logger.error("FATAL ERROR: BOT_TOKEN not set.")
         return
     if ADMIN_ID == 0:
-        logger.error("FATAL ERROR: ADMIN_ID not set.")
-        return
-    
+        logger.warning("WARNING: ADMIN_ID not set correctly (is 0). Some admin features may not work.")
+
     # 1. Start the dummy web server in a separate thread (KEEPS RENDER AWAKE)
     keep_alive()
 
     # 2. Build App
     app = Application.builder().token(BOT_TOKEN).read_timeout(7).write_timeout(30).arbitrary_callback_data(True).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("service", service_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
@@ -1288,7 +1306,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-    
+
     logger.info("Elevate Promotion bot starting...")
     app.run_polling()
 
