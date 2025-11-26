@@ -1,7 +1,9 @@
+import socket
 import os
 import logging
 import psycopg2
 from datetime import datetime
+import pytz
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -15,14 +17,25 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import pytz
-from keep_alive import keep_alive  # Imports the 24/7 trick
+
+# --- FIX FOR RENDER/SUPABASE CONNECTION (IPv4 FORCE) ---
+# Render free tier often fails with Supabase IPv6 addresses. 
+# This code forces the bot to use IPv4 only.
+old_getaddrinfo = socket.getaddrinfo
+def new_getaddrinfo(*args, **kwargs):
+    responses = old_getaddrinfo(*args, **kwargs)
+    return [response for response in responses if response[0] == socket.AF_INET]
+socket.getaddrinfo = new_getaddrinfo
+# -------------------------------------------------------
+
+# Import the keep_alive script (Must be in the same folder)
+from keep_alive import keep_alive  
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else 0
-DATABASE_URL = os.getenv("DATABASE_URL") # This comes from Render Settings
+DATABASE_URL = os.getenv("DATABASE_URL") # Comes from Render Environment Variables
 
 WELCOME_VIDEO = "pos 1.jpg" # File must be in GitHub repo
 
@@ -48,7 +61,6 @@ PAYMENT_INFO = {
 }
 
 # --- SERVICES CONFIGURATION ---
-# (I am collapsing this to save space, it is the same as before)
 SERVICES = {
     "tiktok": {
         "label_am": "ቲክቶክ 🎵", "label_en": "TikTok 🎵",
@@ -347,7 +359,6 @@ def set_referrer_id(user_id: int, referrer_id: int):
     conn.commit()
     rows = cursor.rowcount
     cursor.close()
-    conn.close()
     return rows == 1
 
 def record_invited_user(inviter_id: int, invited_id: int, username: str, firstname: str):
