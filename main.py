@@ -2,6 +2,7 @@ import socket
 import os
 import logging
 import psycopg2
+import urllib.parse
 from datetime import datetime
 import pytz
 from telegram import (
@@ -18,29 +19,18 @@ from telegram.ext import (
     filters,
 )
 
-# --- FIX FOR RENDER/SUPABASE CONNECTION (IPv4 FORCE) ---
-# Render free tier often fails with Supabase IPv6 addresses. 
-# This code forces the bot to use IPv4 only.
-old_getaddrinfo = socket.getaddrinfo
-def new_getaddrinfo(*args, **kwargs):
-    responses = old_getaddrinfo(*args, **kwargs)
-    return [response for response in responses if response[0] == socket.AF_INET]
-socket.getaddrinfo = new_getaddrinfo
-# -------------------------------------------------------
-
-# Import the keep_alive script (Must be in the same folder)
-from keep_alive import keep_alive  
+# Import the keep_alive script
+from keep_alive import keep_alive
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN") 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else 0
-DATABASE_URL = os.getenv("DATABASE_URL") # Comes from Render Environment Variables
-
-WELCOME_VIDEO = "pos 1.jpg" # File must be in GitHub repo
+DATABASE_URL = os.getenv("DATABASE_URL")
+WELCOME_VIDEO = "pos 1.jpg"
 
 # --- GLOBAL CACHE FOR WELCOME MEDIA ---
-WELCOME_MEDIA_CACHE = {"id": None, "type": None} 
+WELCOME_MEDIA_CACHE = {"id": None, "type": None}
 
 # --- TIERED COMMISSION CONFIGURATION ---
 TIERED_COMMISSION = {
@@ -111,15 +101,55 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (POSTGRESQL) ----------------
-# We do not connect globally. We connect per function to ensure safety in threading.
+# ---------------- Database setup (Hybrid DNS Resolution for IPv4/IPv6 Issues) ----------------
+# This method connects by telling the driver:
+# 1. "Use this IPv4 address" (hostaddr) -> Fixes Render's missing IPv6 support
+# 2. "Use this Domain Name" (host) -> Fixes Supabase's SSL Certificate check
 
 def get_db_connection():
     if not DATABASE_URL:
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        # 1. Parse the DATABASE_URL to extract credentials
+        url = urllib.parse.urlparse(DATABASE_URL)
+        username = url.username
+        password = url.password
+        database = url.path[1:]  # Remove leading '/'
+        port = url.port or 5432
+        hostname = url.hostname
+
+        # 2. Manually resolve the hostname to an IPv4 address
+        ip_address = None
+        try:
+            # Forces IPv4 resolution
+            ip_address = socket.gethostbyname(hostname)
+            logger.info(f"Resolved {hostname} to {ip_address}")
+        except Exception as dns_err:
+            logger.error(f"DNS Resolution failed for {hostname}: {dns_err}")
+            # Fallback to hostname if resolution fails (though on Render this might fail)
+            ip_address = None
+
+        # 3. Connect using explicit hostaddr if resolved, else normal connect
+        if ip_address:
+            conn = psycopg2.connect(
+                database=database,
+                user=username,
+                password=password,
+                host=hostname,       # Keep the original hostname for SSL verification
+                hostaddr=ip_address, # Force connection to the IPv4 address
+                port=port,
+                sslmode='require'
+            )
+        else:
+            conn = psycopg2.connect(
+                database=database,
+                user=username,
+                password=password,
+                host=hostname,
+                port=port,
+                sslmode='require'
+            )
         return conn
     except Exception as e:
         logger.error(f"DB Connection failed: {e}")
@@ -130,7 +160,6 @@ def init_db():
     if not conn: return
     cursor = conn.cursor()
     
-    # Users table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
@@ -140,7 +169,6 @@ def init_db():
         referrer_id BIGINT DEFAULT NULL
     )
     """)
-    # Invited Users table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS invited_users (
         inviter_id BIGINT,
@@ -151,7 +179,6 @@ def init_db():
         PRIMARY KEY (inviter_id, invited_id)
     )
     """)
-    # Orders table (SERIAL id for auto-increment)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
@@ -166,7 +193,6 @@ def init_db():
         created_at TEXT
     )
     """)
-    # Recharges table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS recharges (
         id SERIAL PRIMARY KEY,
@@ -178,7 +204,6 @@ def init_db():
         created_at TEXT
     )
     """)
-    # Withdrawals table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS affiliate_withdrawals (
         id SERIAL PRIMARY KEY,
@@ -201,20 +226,19 @@ try:
 except Exception as e:
     logger.error(f"Failed to init DB: {e}")
 
-
 # ---------------- DB helper functions ----------------
 def get_balance(user_id: int) -> float:
     conn = get_db_connection()
+    if not conn: return 0.0
     cursor = conn.cursor()
     cursor.execute("SELECT balance FROM users WHERE user_id=%s", (user_id, ))
     r = cursor.fetchone()
-    if r: 
+    if r:
         bal = r[0]
         cursor.close()
         conn.close()
         return bal
     
-    # If user doesn't exist, create them
     cursor.execute("INSERT INTO users (user_id, balance, lang) VALUES (%s, 0, 'am') ON CONFLICT (user_id) DO NOTHING", (user_id, ))
     conn.commit()
     cursor.close()
@@ -225,9 +249,9 @@ def add_balance(user_id: int, amount: float) -> float:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO users (user_id, balance) VALUES (%s, %s) 
-        ON CONFLICT(user_id) 
-        DO UPDATE SET balance = users.balance + EXCLUDED.balance
+    INSERT INTO users (user_id, balance) VALUES (%s, %s)
+    ON CONFLICT(user_id)
+    DO UPDATE SET balance = users.balance + EXCLUDED.balance
     """, (user_id, amount))
     conn.commit()
     cursor.close()
@@ -263,7 +287,7 @@ def update_order_status(order_id: int, status: str):
     conn.commit()
     cursor.close()
     conn.close()
-    
+
 def get_order_details(order_id: int) -> dict or None:
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -296,6 +320,7 @@ def update_recharge_status(recharge_id: int, status: str, admin_message_id: int 
 
 def _get_user_language(user_id: int) -> str:
     conn = get_db_connection()
+    if not conn: return 'am'
     cursor = conn.cursor()
     cursor.execute("SELECT lang FROM users WHERE user_id=%s", (user_id,))
     r = cursor.fetchone()
@@ -313,6 +338,7 @@ def _set_user_language(user_id: int, lang: str):
 
 def get_affiliate_balance(user_id: int) -> float:
     conn = get_db_connection()
+    if not conn: return 0.0
     cursor = conn.cursor()
     cursor.execute("SELECT affiliate_balance FROM users WHERE user_id=%s", (user_id, ))
     r = cursor.fetchone()
@@ -324,9 +350,9 @@ def add_affiliate_balance(user_id: int, amount: float):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO users (user_id, affiliate_balance) VALUES (%s, %s) 
-        ON CONFLICT(user_id) 
-        DO UPDATE SET affiliate_balance = users.affiliate_balance + EXCLUDED.affiliate_balance
+    INSERT INTO users (user_id, affiliate_balance) VALUES (%s, %s)
+    ON CONFLICT(user_id)
+    DO UPDATE SET affiliate_balance = users.affiliate_balance + EXCLUDED.affiliate_balance
     """, (user_id, amount))
     conn.commit()
     cursor.close()
@@ -371,7 +397,7 @@ def record_invited_user(inviter_id: int, invited_id: int, username: str, firstna
         cursor.close()
         conn.close()
         return True
-    except psycopg2.IntegrityError: 
+    except psycopg2.IntegrityError:
         cursor.close()
         conn.close()
         return False
@@ -435,6 +461,7 @@ def get_withdrawal_history(user_id: int) -> list:
 
 def get_last_orders(user_id: int, limit: int = 10) -> list:
     conn = get_db_connection()
+    if not conn: return []
     cursor = conn.cursor()
     cursor.execute("SELECT id, package_title, price, status, created_at FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT %s", (user_id, limit))
     res = cursor.fetchall()
@@ -537,15 +564,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             except Exception: pass
         except (ValueError, IndexError): pass
 
-    caption = t(lang, f"""Hello 👋 Welcome to Elevate Promotion advertising agency! Increase your recognition by using Elevate's advertising technology to buy followers, likes, views on YouTube, Facebook, Instagram, TikTok, 
-and by using other services! For more information, call 0955974297 or send a message to @Elevatesupport.
-
-Your balance: {balance:.2f} ETB
-Choose a service below.""", f"""ሰላም 👋  እንኳን ወደ ኢሊቬት ፕሮሞሽን  የ ማስታወቅያ ድርጅት በ ሰላም መጡ ! የ ኢሊቫትን የማስተወቅያ ቴክኖሎጂ በመጠቀም በ Youtube, Facebook , Instagram , Tiktok  ላይ ተከታይ ፣ ላይክ ፣ ቪው በመግዛት 
- እና ሌሎች አገልግሎቶችን በመጠቀም እውቅናዎን ያሳድጉ! ለበለጠ መረጃ በ 0955974297 ይደውሉ ወይም  @Elevatesupport ላይ መልክት ይላኩልን።
-
-ቀሪ ብር: {balance:.2f}
-እባክዎን ከዚህ አገልግሎት ይምረጡ።""")
+    caption = t(lang, f"""Hello 👋 Welcome to Elevate Promotion advertising agency! Increase your recognition by using Elevate's advertising technology to buy followers, likes, views on YouTube, Facebook, Instagram, TikTok,
+    and by using other services! For more information, call 0955974297 or send a message to @Elevatesupport.
+    Your balance: {balance:.2f} ETB
+    Choose a service below.""", f"""ሰላም 👋  እንኳን ወደ ኢሊቬት ፕሮሞሽን  የ ማስታወቅያ ድርጅት በ ሰላም መጡ ! የ ኢሊቫትን የማስተወቅያ ቴክኖሎጂ በመጠቀም በ Youtube, Facebook , Instagram , Tiktok  ላይ ተከታይ ፣ ላይክ ፣ ቪው በመግዛት
+    እና ሌሎች አገልግሎቶችን በመጠቀም እውቅናዎን ያሳድጉ! ለበለጠ መረጃ በ 0955974297 ይደውሉ ወይም  @Elevatesupport ላይ መልክት ይላኩልን።
+    ቀሪ ብር: {balance:.2f}
+    እባክዎን ከዚህ አገልግሎት ይምረጡ።""")
 
     buttons = []
     row = []
@@ -556,7 +581,7 @@ Choose a service below.""", f"""ሰላም 👋  እንኳን ወደ ኢሊቬት
             buttons.append(row)
             row = []
     if row: buttons.append(row)
-    
+
     buttons.append([InlineKeyboardButton(t(lang, "Balance", "ቀሪ ሂሳብ"), callback_data="cmd|balance"), InlineKeyboardButton(t(lang, "Recharge", "ገንዘብ ማስገቢያ"), callback_data="cmd|recharge")])
     buttons.append([InlineKeyboardButton(t(lang, "Affiliate Program", "ሰው በመጋበዝ ገንዘብ ይስሩ"), callback_data="cmd|referral")])
     buttons.append([InlineKeyboardButton(t(lang, "Language", "ቋንቋ"), callback_data="cmd|language")])
@@ -973,7 +998,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text(t(lang, "Please send a valid number amount.", "እባክዎ ትክክለኛ ቁጥር ይላኩ።"))
         return
-    
+
     # --- Withdrawal Detail ---
     if context.user_data.get("awaiting_withdrawal_detail"):
         detail = update.message.text.strip()
@@ -1125,12 +1150,12 @@ async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         def __init__(self, data, from_user):
             self.data = data
             self.from_user = from_user
-            self.message = None 
-        async def answer(self): pass 
+            self.message = None
+        async def answer(self): pass
     mock_query = MockQuery("cmd|referral", update.effective_user)
-    update.callback_query = mock_query 
+    update.callback_query = mock_query
     await callback_handler(update, context)
-    update.callback_query = None 
+    update.callback_query = None
 
 async def addbalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -1163,19 +1188,19 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     caption_text = (
-        "💸 *በኢሊቬት ገንዘብ ይስሩ!* 💸\n\n"
-        "ብዙ ሰዎች ሌሎችን በመጋበዝ ብቻ በቦታችን በሺዎች የሚቆጠር ገንዘብ እየሰሩ ነው! 😱\n\n"
-        "እርስዎም ጓደኞችዎን በመጋበዝ ከሚያስገቡት ክፍያ ላይ ኮሚሽን ማግኘት ይችላሉ።\n\n"
-        "👇 የመጋበዣ ሊንክዎን ለማግኘት እና ገቢ ለመጀመር ከታች ያለውን ይጫኑ!\n\n"
-        "--------------------------------\n\n"
-        "💸 *Make Money with Elevate!* 💸\n\n"
-        "Many people are making thousands of birr using our bot just by inviting others! 😱\n\n"
-        "Don't miss out! You can also earn commissions on every deposit your friends make.\n\n"
-        "👇 Click the button below to get your Invite Link and start earning today!"
+    "💸 በኢሊቬት ገንዘብ ይስሩ! 💸\n\n"
+    "ብዙ ሰዎች ሌሎችን በመጋበዝ ብቻ በቦታችን በሺዎች የሚቆጠር ገንዘብ እየሰሩ ነው! 😱\n\n"
+    "እርስዎም ጓደኞችዎን በመጋበዝ ከሚያስገቡት ክፍያ ላይ ኮሚሽን ማግኘት ይችላሉ።\n\n"
+    "👇 የመጋበዣ ሊንክዎን ለማግኘት እና ገቢ ለመጀመር ከታች ያለውን ይጫኑ!\n\n"
+    "--------------------------------\n\n"
+    "💸 Make Money with Elevate! 💸\n\n"
+    "Many people are making thousands of birr using our bot just by inviting others! 😱\n\n"
+    "Don't miss out! You can also earn commissions on every deposit your friends make.\n\n"
+    "👇 Click the button below to get your Invite Link and start earning today!"
     )
     keyboard = [[InlineKeyboardButton("💰 Join Affiliate Program / ገንዘብ ማግኘት ይጀምሩ 💰", callback_data="cmd|referral")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    photo_name = "pos 1.jpg" 
+    photo_name = "pos 1.jpg"
     users = get_all_user_ids()
     await update.message.reply_text(f"⏳ Sending Affiliate Promo to {len(users)} users...")
     if not os.path.isfile(photo_name):
@@ -1186,7 +1211,7 @@ async def post_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with open(photo_name, 'rb') as ph:
                 await context.bot.send_photo(chat_id=uid, photo=ph, caption=caption_text, parse_mode='Markdown', reply_markup=reply_markup)
-            success += 1
+                success += 1
         except Exception: pass
     await update.message.reply_text(f"✅ Done! Sent to {success} users.")
 
@@ -1194,16 +1219,16 @@ async def my_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = _get_user_language(user_id)
     context.user_data['lang'] = lang
-    
+
     orders = get_last_orders(user_id)
-    
+
     if not orders:
         msg = t(lang, "You have no order history.", "የትዕዛዝ ታሪክ የለዎትም።")
         await update.message.reply_text(msg)
         return
 
     text = t(lang, "*📦 Your Recent Orders:*\n\n", "*📦 የእርስዎ የቅርብ ትዕዛዞች:*\n\n")
-    
+
     for oid, title, price, status, date in orders:
         status_display = status.upper()
         if status in ['pending', 'pending_approval', 'processing']:
@@ -1221,7 +1246,7 @@ async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = _get_user_language(user_id)
     context.user_data['lang'] = lang
-    
+
     msg = t(lang, 
             "📞 *Support & Info*\n\nFor any issues, deposits, or questions, please contact our support team:\n\n👤 @Elevatesupport\n📞 0955974297",
             "📞 *መረጃ እና እርዳታ*\n\nለማንኛውም ጥያቄ ወይም ችግር፣ እባክዎ የድጋፍ ቡድናችንን ያግኙ:\n\n👤 @Elevatesupport\n📞 0955974297"
@@ -1247,13 +1272,13 @@ def main():
     if ADMIN_ID == 0:
         logger.error("FATAL ERROR: ADMIN_ID not set.")
         return
-    
+
     # 1. Start the dummy web server in a separate thread (KEEPS RENDER AWAKE)
     keep_alive()
 
     # 2. Build App
     app = Application.builder().token(BOT_TOKEN).read_timeout(7).write_timeout(30).arbitrary_callback_data(True).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("service", service_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
@@ -1270,7 +1295,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-    
+
     logger.info("Elevate Promotion bot starting...")
     app.run_polling()
 
