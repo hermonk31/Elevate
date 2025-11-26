@@ -4,6 +4,7 @@ import logging
 import psycopg2
 import urllib.parse
 from datetime import datetime
+import pytz
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -101,28 +102,41 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (SIMPLE IPV4 RESOLVE) ----------------
+# ---------------- Database setup (Hybrid DNS Resolution for IPv4/IPv6 Issues) ----------------
+# This method connects by telling the driver:
+# 1. "Use this IPv4 address" (hostaddr) -> Fixes Render's missing IPv6 support
+# 2. "Use this Domain Name" (host) -> Fixes Supabase's SSL Certificate check
+
 def get_db_connection():
     if not DATABASE_URL:
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        # 1. Parse the URL
+        # 1. Parse the DATABASE_URL to extract credentials
         url = urllib.parse.urlparse(DATABASE_URL)
-        
-        # 2. Force IPv4 resolution of the hostname
-        # 'socket.gethostbyname' only returns IPv4 addresses.
-        # If Render tries IPv6 by default, this overrides it.
-        host_ip = socket.gethostbyname(url.hostname)
-        
-        # 3. Connect using the IP address
-        # sslmode='require' is essential for Supabase
+        username = url.username
+        password = url.password
+        database = url.path[1:] # Remove leading '/'
+        port = url.port or 5432
+        hostname = url.hostname
+
+        # 2. Manually resolve the hostname to an IPv4 address
+        try:
+            # Forces IPv4 resolution
+            ip_address = socket.gethostbyname(hostname)
+            logger.info(f"Resolved {hostname} to {ip_address}")
+        except Exception as dns_err:
+            logger.error(f"DNS Resolution failed for {hostname}: {dns_err}")
+            return None
+
+        # 3. Connect using explicit hostaddr
         conn = psycopg2.connect(
-            user=url.username,
-            password=url.password,
-            host=host_ip,
-            port=url.port,
-            database=url.path[1:],
+            database=database,
+            user=username,
+            password=password,
+            host=hostname,       # Keep the original hostname for SSL verification
+            hostaddr=ip_address, # Force connection to the IPv4 address
+            port=port,
             sslmode='require'
         )
         return conn
@@ -967,7 +981,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amount = float(txt)
             if amount <= 0: raise ValueError("Amount must be positive.")
-            context.application.bot_data[f"recharge_pending:{user.id}"] = {"amount": amount, "method": None}
+            context.application.bot_data[f"recharge_pending:{user_id}"] = {"amount": amount, "method": None}
             context.user_data.pop("awaiting_custom_recharge_amount", None)
             kb = []
             for m in PAYMENT_INFO.keys(): kb.append([InlineKeyboardButton(m.capitalize(), callback_data=f"recharge_pay|{m}")])
