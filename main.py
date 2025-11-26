@@ -4,7 +4,6 @@ import logging
 import psycopg2
 import urllib.parse
 from datetime import datetime
-import pytz
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -102,45 +101,28 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (Manual DNS Resolution) ----------------
-# We manually resolve the hostname to an IPv4 address to bypass Render's IPv6 issues.
-
+# ---------------- Database setup (SIMPLE IPV4 RESOLVE) ----------------
 def get_db_connection():
     if not DATABASE_URL:
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        # 1. Parse the DATABASE_URL to extract credentials
+        # 1. Parse the URL
         url = urllib.parse.urlparse(DATABASE_URL)
-        username = url.username
-        password = url.password
-        database = url.path[1:] # Remove leading '/'
-        port = url.port or 5432
-        hostname = url.hostname
-
-        # 2. Manually resolve the hostname to an IPv4 address
-        # socket.getaddrinfo is more robust than gethostbyname
-        # AF_INET forces IPv4. SOCK_STREAM means TCP.
-        try:
-            addr_info = socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
-            # The result is a list of tuples. We take the first one.
-            # format: (family, type, proto, canonname, sockaddr)
-            # sockaddr is (ip_address, port)
-            ip_address = addr_info[0][4][0]
-            logger.info(f"Resolved {hostname} to {ip_address}")
-        except Exception as dns_err:
-            logger.error(f"DNS Resolution failed for {hostname}: {dns_err}")
-            return None
-
-        # 3. Connect using the IP Address
-        # sslmode='require' is CRITICAL here. It encrypts the connection
-        # but does NOT check if the certificate matches the IP address (which it won't).
+        
+        # 2. Force IPv4 resolution of the hostname
+        # 'socket.gethostbyname' only returns IPv4 addresses.
+        # If Render tries IPv6 by default, this overrides it.
+        host_ip = socket.gethostbyname(url.hostname)
+        
+        # 3. Connect using the IP address
+        # sslmode='require' is essential for Supabase
         conn = psycopg2.connect(
-            database=database,
-            user=username,
-            password=password,
-            host=ip_address,
-            port=port,
+            user=url.username,
+            password=url.password,
+            host=host_ip,
+            port=url.port,
+            database=url.path[1:],
             sslmode='require'
         )
         return conn
@@ -985,7 +967,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amount = float(txt)
             if amount <= 0: raise ValueError("Amount must be positive.")
-            context.application.bot_data[f"recharge_pending:{user_id}"] = {"amount": amount, "method": None}
+            context.application.bot_data[f"recharge_pending:{user.id}"] = {"amount": amount, "method": None}
             context.user_data.pop("awaiting_custom_recharge_amount", None)
             kb = []
             for m in PAYMENT_INFO.keys(): kb.append([InlineKeyboardButton(m.capitalize(), callback_data=f"recharge_pay|{m}")])
