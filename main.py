@@ -2,7 +2,7 @@ import socket
 import os
 import logging
 import psycopg2
-import urllib.parse 
+import urllib.parse
 from datetime import datetime
 import pytz
 from telegram import (
@@ -102,28 +102,47 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (POSTGRESQL - Force IPv4) ----------------
-# We do not connect globally. We connect per function to ensure safety in threading.
+# ---------------- Database setup (Manual DNS Resolution) ----------------
+# We manually resolve the hostname to an IPv4 address to bypass Render's IPv6 issues.
 
 def get_db_connection():
     if not DATABASE_URL:
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        # 1. Parse URL to find the hostname
-        result = urllib.parse.urlparse(DATABASE_URL)
-        hostname = result.hostname
-        
-        # 2. Resolve hostname to IPv4 address explicitly
-        # This uses Python's DNS which we can control/is usually IPv4 on Render
-        ip_address = socket.gethostbyname(hostname)
-        
-        # 3. Create a new URL with the IP address instead of the domain
-        # We replace the hostname in the string to preserve password/ports/args
-        new_db_url = DATABASE_URL.replace(hostname, ip_address)
-        
-        # 4. Connect using the IP address URL
-        conn = psycopg2.connect(new_db_url)
+        # 1. Parse the DATABASE_URL to extract credentials
+        url = urllib.parse.urlparse(DATABASE_URL)
+        username = url.username
+        password = url.password
+        database = url.path[1:] # Remove leading '/'
+        port = url.port or 5432
+        hostname = url.hostname
+
+        # 2. Manually resolve the hostname to an IPv4 address
+        # socket.getaddrinfo is more robust than gethostbyname
+        # AF_INET forces IPv4. SOCK_STREAM means TCP.
+        try:
+            addr_info = socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
+            # The result is a list of tuples. We take the first one.
+            # format: (family, type, proto, canonname, sockaddr)
+            # sockaddr is (ip_address, port)
+            ip_address = addr_info[0][4][0]
+            logger.info(f"Resolved {hostname} to {ip_address}")
+        except Exception as dns_err:
+            logger.error(f"DNS Resolution failed for {hostname}: {dns_err}")
+            return None
+
+        # 3. Connect using the IP Address
+        # sslmode='require' is CRITICAL here. It encrypts the connection
+        # but does NOT check if the certificate matches the IP address (which it won't).
+        conn = psycopg2.connect(
+            database=database,
+            user=username,
+            password=password,
+            host=ip_address,
+            port=port,
+            sslmode='require'
+        )
         return conn
     except Exception as e:
         logger.error(f"DB Connection failed: {e}")
@@ -134,7 +153,6 @@ def init_db():
     if not conn: return
     cursor = conn.cursor()
     
-    # Users table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
@@ -144,7 +162,6 @@ def init_db():
         referrer_id BIGINT DEFAULT NULL
     )
     """)
-    # Invited Users table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS invited_users (
         inviter_id BIGINT,
@@ -155,7 +172,6 @@ def init_db():
         PRIMARY KEY (inviter_id, invited_id)
     )
     """)
-    # Orders table (SERIAL id for auto-increment)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
@@ -170,7 +186,6 @@ def init_db():
         created_at TEXT
     )
     """)
-    # Recharges table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS recharges (
         id SERIAL PRIMARY KEY,
@@ -182,7 +197,6 @@ def init_db():
         created_at TEXT
     )
     """)
-    # Withdrawals table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS affiliate_withdrawals (
         id SERIAL PRIMARY KEY,
@@ -209,6 +223,7 @@ except Exception as e:
 # ---------------- DB helper functions ----------------
 def get_balance(user_id: int) -> float:
     conn = get_db_connection()
+    if not conn: return 0.0
     cursor = conn.cursor()
     cursor.execute("SELECT balance FROM users WHERE user_id=%s", (user_id, ))
     r = cursor.fetchone()
@@ -218,7 +233,6 @@ def get_balance(user_id: int) -> float:
         conn.close()
         return bal
     
-    # If user doesn't exist, create them
     cursor.execute("INSERT INTO users (user_id, balance, lang) VALUES (%s, 0, 'am') ON CONFLICT (user_id) DO NOTHING", (user_id, ))
     conn.commit()
     cursor.close()
@@ -300,6 +314,7 @@ def update_recharge_status(recharge_id: int, status: str, admin_message_id: int 
 
 def _get_user_language(user_id: int) -> str:
     conn = get_db_connection()
+    if not conn: return 'am'
     cursor = conn.cursor()
     cursor.execute("SELECT lang FROM users WHERE user_id=%s", (user_id,))
     r = cursor.fetchone()
@@ -317,6 +332,7 @@ def _set_user_language(user_id: int, lang: str):
 
 def get_affiliate_balance(user_id: int) -> float:
     conn = get_db_connection()
+    if not conn: return 0.0
     cursor = conn.cursor()
     cursor.execute("SELECT affiliate_balance FROM users WHERE user_id=%s", (user_id, ))
     r = cursor.fetchone()
@@ -439,6 +455,7 @@ def get_withdrawal_history(user_id: int) -> list:
 
 def get_last_orders(user_id: int, limit: int = 10) -> list:
     conn = get_db_connection()
+    if not conn: return []
     cursor = conn.cursor()
     cursor.execute("SELECT id, package_title, price, status, created_at FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT %s", (user_id, limit))
     res = cursor.fetchall()
