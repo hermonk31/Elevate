@@ -20,7 +20,12 @@ from telegram.ext import (
 )
 
 # Import the keep_alive script
-from keep_alive import keep_alive
+# Ensure keep_alive.py is in the same folder
+try:
+    from keep_alive import keep_alive
+except ImportError:
+    # Fallback if file missing
+    def keep_alive(): pass
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -102,16 +107,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------- Database setup (Hybrid DNS Resolution for IPv4/IPv6 Issues) ----------------
-# This method connects by telling the driver:
-# 1. "Use this IPv4 address" (hostaddr) -> Fixes Render's missing IPv6 support
-# 2. "Use this Domain Name" (host) -> Fixes Supabase's SSL Certificate check
+# This method uses getaddrinfo with AF_INET to STRICTLY find an IPv4 address.
+# This fixes Render failures where IPv6 addresses are returned but unreachable.
 
 def get_db_connection():
     if not DATABASE_URL:
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        # 1. Parse the DATABASE_URL to extract credentials
         url = urllib.parse.urlparse(DATABASE_URL)
         username = url.username
         password = url.password
@@ -119,29 +122,36 @@ def get_db_connection():
         port = url.port or 5432
         hostname = url.hostname
 
-        # 2. Manually resolve the hostname to an IPv4 address
         ip_address = None
         try:
-            # Forces IPv4 resolution
-            ip_address = socket.gethostbyname(hostname)
-            logger.info(f"Resolved {hostname} to {ip_address}")
+            # STRICTLY LOOK FOR IPv4 (AF_INET)
+            # This avoids getting an IPv6 address which Render fails on
+            logger.info(f"Attempting to resolve {hostname} to IPv4...")
+            infos = socket.getaddrinfo(hostname, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+            if infos:
+                # infos[0] is (family, type, proto, canonname, sockaddr)
+                # sockaddr is (address, port)
+                ip_address = infos[0][4][0]
+                logger.info(f"Resolved {hostname} to IPv4: {ip_address}")
+            else:
+                logger.warning(f"No IPv4 address found for {hostname}")
         except Exception as dns_err:
-            logger.error(f"DNS Resolution failed for {hostname}: {dns_err}")
-            # Fallback to hostname if resolution fails (though on Render this might fail)
+            logger.error(f"IPv4 DNS Resolution failed for {hostname}: {dns_err}")
             ip_address = None
 
-        # 3. Connect using explicit hostaddr if resolved, else normal connect
         if ip_address:
             conn = psycopg2.connect(
                 database=database,
                 user=username,
                 password=password,
-                host=hostname,       # Keep the original hostname for SSL verification
-                hostaddr=ip_address, # Force connection to the IPv4 address
+                host=hostname,       
+                hostaddr=ip_address, # Force IPv4
                 port=port,
                 sslmode='require'
             )
         else:
+            # Fallback (likely to fail if IPv6 is picked, but better than nothing)
+            logger.warning("Falling back to default resolution (might use IPv6)...")
             conn = psycopg2.connect(
                 database=database,
                 user=username,
