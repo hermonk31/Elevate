@@ -4,7 +4,6 @@ import logging
 import psycopg2
 import urllib.parse
 from datetime import datetime
-import pytz
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -102,8 +101,9 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (Manual DNS Resolution) ----------------
-# We manually resolve the hostname to an IPv4 address to bypass Render's IPv6 issues.
+# ---------------- Database setup (Robust Connection with Failover) ----------------
+# This version attempts IPv4 resolution first, then falls back to standard connection
+# to avoid crashes on Render Free Tier.
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -114,38 +114,35 @@ def get_db_connection():
         url = urllib.parse.urlparse(DATABASE_URL)
         username = url.username
         password = url.password
-        database = url.path[1:] # Remove leading '/'
+        database = url.path[1:]
         port = url.port or 5432
         hostname = url.hostname
-
-        # 2. Manually resolve the hostname to an IPv4 address
-        # socket.getaddrinfo is more robust than gethostbyname
-        # AF_INET forces IPv4. SOCK_STREAM means TCP.
+        
+        final_host = hostname
+        
+        # 2. Attempt to force IPv4 (Render Fix)
+        # We wrap this in a try/except block so it doesn't crash the bot if DNS fails
         try:
             addr_info = socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
-            # The result is a list of tuples. We take the first one.
-            # format: (family, type, proto, canonname, sockaddr)
-            # sockaddr is (ip_address, port)
             ip_address = addr_info[0][4][0]
-            logger.info(f"Resolved {hostname} to {ip_address}")
+            final_host = ip_address
+            logger.info(f"Successfully resolved {hostname} to IPv4: {ip_address}")
         except Exception as dns_err:
-            logger.error(f"DNS Resolution failed for {hostname}: {dns_err}")
-            return None
-
-        # 3. Connect using the IP Address
-        # sslmode='require' is CRITICAL here. It encrypts the connection
-        # but does NOT check if the certificate matches the IP address (which it won't).
+            logger.warning(f"IPv4 resolution failed ({dns_err}). Trying standard connection to {hostname}...")
+            # If resolution fails, we KEEP final_host as the original hostname
+            # This allows the standard library to try its own connection logic
+        
+        # 3. Connect (using either the resolved IP or the original hostname)
         conn = psycopg2.connect(
             database=database,
             user=username,
             password=password,
-            host=ip_address,
-            port=port,
-            sslmode='require'
+            host=final_host,
+            port=port
         )
         return conn
     except Exception as e:
-        logger.error(f"DB Connection failed: {e}")
+        logger.error(f"CRITICAL: DB Connection failed. Error: {e}")
         return None
 
 def init_db():
