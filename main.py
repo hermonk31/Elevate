@@ -19,17 +19,16 @@ from telegram.ext import (
     filters,
 )
 
-# Import the keep_alive script
-# Ensure keep_alive.py is in the same folder
+# --- KEEP ALIVE ---
 try:
     from keep_alive import keep_alive
 except ImportError:
-    # Fallback if file missing
     def keep_alive(): pass
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
+# default to 0 if not set, prevents crash on startup
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else 0
 DATABASE_URL = os.getenv("DATABASE_URL")
 WELCOME_VIDEO = "pos 1.jpg"
@@ -107,8 +106,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------- Database setup (Hybrid DNS Resolution for IPv4/IPv6 Issues) ----------------
-# This method uses getaddrinfo with AF_INET to STRICTLY find an IPv4 address.
-# This fixes Render failures where IPv6 addresses are returned but unreachable.
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -126,17 +123,23 @@ def get_db_connection():
         try:
             # STRICTLY LOOK FOR IPv4 (AF_INET)
             # This avoids getting an IPv6 address which Render fails on
-            logger.info(f"Attempting to resolve {hostname} to IPv4...")
+            # logger.info(f"Attempting to resolve {hostname} to IPv4...")
             infos = socket.getaddrinfo(hostname, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
             if infos:
-                # infos[0] is (family, type, proto, canonname, sockaddr)
-                # sockaddr is (address, port)
                 ip_address = infos[0][4][0]
                 logger.info(f"Resolved {hostname} to IPv4: {ip_address}")
-            else:
-                logger.warning(f"No IPv4 address found for {hostname}")
         except Exception as dns_err:
-            logger.error(f"IPv4 DNS Resolution failed for {hostname}: {dns_err}")
+            if "supa" in str(hostname):
+                logger.critical("\n\n" + "="*50)
+                logger.critical("❌ IPV4 RESOLUTION FAILED FOR SUPABASE DATABASE")
+                logger.critical("Your Supabase connection string is likely using the DIRECT (IPv6-only) URL.")
+                logger.critical("Render REQUIRES IPv4. You MUST use the Supavisor POOLER URL.")
+                logger.critical(f"Current Host: {hostname} (Port: {port})")
+                logger.critical("👉 ACTION REQUIRED: Go to Supabase Dashboard -> Project Settings -> Database -> Connection Pooling.")
+                logger.critical("👉 Copy the URL (port 6543) and update your Render DATABASE_URL environment variable.")
+                logger.critical("="*50 + "\n\n")
+            else:
+                logger.error(f"IPv4 DNS Resolution failed for {hostname}: {dns_err}")
             ip_address = None
 
         if ip_address:
@@ -150,8 +153,7 @@ def get_db_connection():
                 sslmode='require'
             )
         else:
-            # Fallback (likely to fail if IPv6 is picked, but better than nothing)
-            logger.warning("Falling back to default resolution (might use IPv6)...")
+            # Fallback - will likely fail on Render if no IPv4 was found
             conn = psycopg2.connect(
                 database=database,
                 user=username,
@@ -234,7 +236,7 @@ def init_db():
 try:
     init_db()
 except Exception as e:
-    logger.error(f"Failed to init DB: {e}")
+    logger.error(f"Failed to init DB on startup (non-fatal, will retry on demand): {e}")
 
 # ---------------- DB helper functions ----------------
 def get_balance(user_id: int) -> float:
@@ -1280,8 +1282,7 @@ def main():
         logger.error("FATAL ERROR: BOT_TOKEN not set.")
         return
     if ADMIN_ID == 0:
-        logger.error("FATAL ERROR: ADMIN_ID not set.")
-        return
+        logger.warning("WARNING: ADMIN_ID not set correctly (is 0). Some admin features may not work.")
 
     # 1. Start the dummy web server in a separate thread (KEEPS RENDER AWAKE)
     keep_alive()
