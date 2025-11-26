@@ -2,6 +2,7 @@ import socket
 import os
 import logging
 import psycopg2
+import urllib.parse 
 from datetime import datetime
 import pytz
 from telegram import (
@@ -18,26 +19,16 @@ from telegram.ext import (
     filters,
 )
 
-# --- FIX FOR RENDER/SUPABASE CONNECTION (IPv4 FORCE) ---
-# Render free tier often fails with Supabase IPv6 addresses. 
-# This code forces the bot to use IPv4 only.
-old_getaddrinfo = socket.getaddrinfo
-def new_getaddrinfo(*args, **kwargs):
-    responses = old_getaddrinfo(*args, **kwargs)
-    return [response for response in responses if response[0] == socket.AF_INET]
-socket.getaddrinfo = new_getaddrinfo
-# -------------------------------------------------------
-
-# Import the keep_alive script (Must be in the same folder)
+# Import the keep_alive script
 from keep_alive import keep_alive  
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else 0
-DATABASE_URL = os.getenv("DATABASE_URL") # Comes from Render Environment Variables
+DATABASE_URL = os.getenv("DATABASE_URL") 
 
-WELCOME_VIDEO = "pos 1.jpg" # File must be in GitHub repo
+WELCOME_VIDEO = "pos 1.jpg" 
 
 # --- GLOBAL CACHE FOR WELCOME MEDIA ---
 WELCOME_MEDIA_CACHE = {"id": None, "type": None} 
@@ -111,7 +102,7 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (POSTGRESQL) ----------------
+# ---------------- Database setup (POSTGRESQL - Force IPv4) ----------------
 # We do not connect globally. We connect per function to ensure safety in threading.
 
 def get_db_connection():
@@ -119,7 +110,20 @@ def get_db_connection():
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        # 1. Parse URL to find the hostname
+        result = urllib.parse.urlparse(DATABASE_URL)
+        hostname = result.hostname
+        
+        # 2. Resolve hostname to IPv4 address explicitly
+        # This uses Python's DNS which we can control/is usually IPv4 on Render
+        ip_address = socket.gethostbyname(hostname)
+        
+        # 3. Create a new URL with the IP address instead of the domain
+        # We replace the hostname in the string to preserve password/ports/args
+        new_db_url = DATABASE_URL.replace(hostname, ip_address)
+        
+        # 4. Connect using the IP address URL
+        conn = psycopg2.connect(new_db_url)
         return conn
     except Exception as e:
         logger.error(f"DB Connection failed: {e}")
