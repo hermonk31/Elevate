@@ -1,8 +1,6 @@
-import socket
 import os
 import logging
 import psycopg2
-import urllib.parse
 from datetime import datetime
 import pytz
 from telegram import (
@@ -102,43 +100,16 @@ SERVICES = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Database setup (Hybrid DNS Resolution for IPv4/IPv6 Issues) ----------------
-# This method connects by telling the driver:
-# 1. "Use this IPv4 address" (hostaddr) -> Fixes Render's missing IPv6 support
-# 2. "Use this Domain Name" (host) -> Fixes Supabase's SSL Certificate check
+# ---------------- Database setup (STANDARD) ----------------
+# No hacks. Just standard connection.
 
 def get_db_connection():
     if not DATABASE_URL:
         logger.error("DATABASE_URL is not set!")
         return None
     try:
-        # 1. Parse the DATABASE_URL to extract credentials
-        url = urllib.parse.urlparse(DATABASE_URL)
-        username = url.username
-        password = url.password
-        database = url.path[1:] # Remove leading '/'
-        port = url.port or 5432
-        hostname = url.hostname
-
-        # 2. Manually resolve the hostname to an IPv4 address
-        try:
-            # Forces IPv4 resolution
-            ip_address = socket.gethostbyname(hostname)
-            logger.info(f"Resolved {hostname} to {ip_address}")
-        except Exception as dns_err:
-            logger.error(f"DNS Resolution failed for {hostname}: {dns_err}")
-            return None
-
-        # 3. Connect using explicit hostaddr
-        conn = psycopg2.connect(
-            database=database,
-            user=username,
-            password=password,
-            host=hostname,       # Keep the original hostname for SSL verification
-            hostaddr=ip_address, # Force connection to the IPv4 address
-            port=port,
-            sslmode='require'
-        )
+        # sslmode='require' is necessary for Supabase
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
         return conn
     except Exception as e:
         logger.error(f"DB Connection failed: {e}")
